@@ -19,6 +19,8 @@ All components run locally. No data leaves your network except chat messages thr
 - Microsoft Azure account (for Teams bot registration)
 - Cloudflare account (for tunnel)
 
+> **Setting up a fresh Mac Mini?** See [SETUP.md](SETUP.md) for complete step-by-step instructions.
+
 ## Quick Start
 
 ### 1. Install Ollama Models
