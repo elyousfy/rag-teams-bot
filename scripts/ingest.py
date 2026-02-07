@@ -2,8 +2,8 @@
 """
 Document ingestion script for the RAG system.
 
-Processes documents from the documents folder and stores embeddings in ChromaDB.
-Supports: PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), Markdown, Text files.
+Uses Docling for layout-aware document parsing with OCR and table extraction.
+Supports: PDF, Word (.docx), PowerPoint (.pptx), HTML, Excel (.xlsx), Markdown, text, images.
 
 Usage:
     python scripts/ingest.py [--clear]
@@ -21,7 +21,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import chromadb
 from llama_index.core import (
-    SimpleDirectoryReader,
     StorageContext,
     VectorStoreIndex,
     Settings,
@@ -29,8 +28,16 @@ from llama_index.core import (
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.readers.docling import DoclingReader
 
 from app import config
+
+# File extensions Docling can handle
+SUPPORTED_EXTENSIONS = [
+    ".pdf", ".docx", ".pptx", ".xlsx",
+    ".html", ".md", ".txt",
+    ".png", ".jpg", ".jpeg", ".tiff", ".bmp",
+]
 
 
 def setup_embedding_model():
@@ -41,42 +48,28 @@ def setup_embedding_model():
     )
 
 
-def load_documents(documents_path: Path) -> list:
-    """Load documents from the specified directory."""
+def find_documents(documents_path: Path) -> list[Path]:
+    """Find all supported documents in the directory."""
     if not documents_path.exists():
         print(f"Creating documents directory: {documents_path}")
         documents_path.mkdir(parents=True, exist_ok=True)
         return []
 
-    # Supported file extensions
-    supported_extensions = [
-        ".pdf", ".docx", ".xlsx", ".pptx",
-        ".md", ".txt", ".json", ".csv"
-    ]
-
-    # Check if there are any documents
     doc_files = []
-    for ext in supported_extensions:
+    for ext in SUPPORTED_EXTENSIONS:
         doc_files.extend(documents_path.glob(f"**/*{ext}"))
 
-    if not doc_files:
-        print(f"No documents found in {documents_path}")
-        print(f"Supported formats: {', '.join(supported_extensions)}")
-        return []
+    return sorted(doc_files)
 
-    print(f"Found {len(doc_files)} document(s) to process:")
-    for f in doc_files:
-        print(f"  - {f.name}")
 
-    # Load documents
-    reader = SimpleDirectoryReader(
-        input_dir=str(documents_path),
-        recursive=True,
-        required_exts=supported_extensions,
-    )
+def load_documents(file_paths: list[Path]) -> list:
+    """Load documents using Docling's layout-aware parser."""
+    # Docling exports as Markdown by default, preserving tables and structure
+    reader = DoclingReader(export_type="markdown")
 
-    documents = reader.load_data()
-    print(f"Loaded {len(documents)} document section(s)")
+    str_paths = [str(p) for p in file_paths]
+    documents = reader.load_data(file_path=str_paths)
+    print(f"Loaded {len(documents)} document section(s) via Docling")
 
     return documents
 
@@ -99,20 +92,17 @@ def setup_vector_store(clear: bool = False) -> tuple:
     chroma_path = config.CHROMA_PATH
     chroma_path.mkdir(parents=True, exist_ok=True)
 
-    # Initialize ChromaDB client
     chroma_client = chromadb.PersistentClient(path=str(chroma_path))
 
     collection_name = "company_docs"
 
     if clear:
-        # Delete existing collection if it exists
         try:
             chroma_client.delete_collection(collection_name)
             print(f"Cleared existing collection: {collection_name}")
         except ValueError:
-            pass  # Collection doesn't exist
+            pass
 
-    # Get or create collection
     chroma_collection = chroma_client.get_or_create_collection(
         name=collection_name,
         metadata={"hnsw:space": "cosine"}
@@ -121,7 +111,6 @@ def setup_vector_store(clear: bool = False) -> tuple:
     existing_count = chroma_collection.count()
     print(f"Collection '{collection_name}' has {existing_count} existing documents")
 
-    # Create vector store
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 
     return vector_store, existing_count
@@ -130,32 +119,45 @@ def setup_vector_store(clear: bool = False) -> tuple:
 def ingest_documents(clear: bool = False):
     """Main ingestion pipeline."""
     print("=" * 60)
-    print("RAG Document Ingestion")
+    print("RAG Document Ingestion (Docling)")
     print("=" * 60)
 
-    # Setup embedding model in Settings
+    # Setup embedding model
     print("\n1. Setting up embedding model...")
     embed_model = setup_embedding_model()
     Settings.embed_model = embed_model
 
-    # Load documents
-    print("\n2. Loading documents...")
-    documents = load_documents(config.DOCUMENTS_PATH)
+    # Find documents
+    print("\n2. Scanning for documents...")
+    doc_files = find_documents(config.DOCUMENTS_PATH)
 
-    if not documents:
-        print("\nNo documents to process. Add documents to:")
-        print(f"  {config.DOCUMENTS_PATH}")
+    if not doc_files:
+        print(f"No documents found in {config.DOCUMENTS_PATH}")
+        print(f"Supported formats: {', '.join(SUPPORTED_EXTENSIONS)}")
         return
 
-    # Create nodes/chunks
-    print("\n3. Chunking documents...")
+    print(f"Found {len(doc_files)} document(s):")
+    for f in doc_files:
+        print(f"  - {f.name}")
+
+    # Load via Docling
+    print("\n3. Parsing documents with Docling...")
+    print("   (Layout analysis, OCR, and table extraction)")
+    documents = load_documents(doc_files)
+
+    if not documents:
+        print("\nNo content extracted. Check that documents are not empty.")
+        return
+
+    # Chunk
+    print("\n4. Chunking documents...")
     nodes = create_nodes(documents)
 
     # Setup vector store
-    print("\n4. Setting up vector store...")
+    print("\n5. Setting up vector store...")
     vector_store, existing_count = setup_vector_store(clear=clear)
 
-    # Warn about potential duplicates
+    # Warn about duplicates
     if existing_count > 0 and not clear:
         print("\n" + "!" * 60)
         print("WARNING: Collection already contains documents!")
@@ -169,11 +171,11 @@ def ingest_documents(clear: bool = False):
 
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    # Create index and embed nodes
-    print("\n5. Creating embeddings and storing in ChromaDB...")
+    # Embed and store
+    print("\n6. Creating embeddings and storing in ChromaDB...")
     print("   (This may take a while depending on document size)")
 
-    index = VectorStoreIndex(
+    VectorStoreIndex(
         nodes=nodes,
         storage_context=storage_context,
         show_progress=True,
@@ -181,7 +183,7 @@ def ingest_documents(clear: bool = False):
 
     print("\n" + "=" * 60)
     print("Ingestion complete!")
-    print(f"Processed {len(documents)} document section(s)")
+    print(f"Processed {len(doc_files)} file(s), {len(documents)} section(s)")
     print(f"Created {len(nodes)} chunks")
     print(f"Stored in: {config.CHROMA_PATH}")
     print("=" * 60)
